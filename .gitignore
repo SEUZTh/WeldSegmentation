@@ -1,4 +1,4 @@
 /build
-/data
-/save_data
+data/
+save_data/
 /.vscode
