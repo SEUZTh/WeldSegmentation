@@ -2,11 +2,12 @@
  * @Auther: Tianhao Zhang
  * @Date: 2022-01-09 11:47:55
  * @LastEditors: Tianhao Zhang
- * @LastEditTime: 2022-02-26 18:09:29
+ * @LastEditTime: 2022-03-21 14:27:54
  * @Description:
  */
 
 #include "plane_segment.h"
+
 
 /**
  * @brief: 点云单平面分割
@@ -67,7 +68,7 @@ bool planeSegment(pcl::PointCloud<PointT>::Ptr &cloud, double distance_threshold
  * @note:
  * @warning:
  */
-std::vector<pcl::PointCloud<PointT>::Ptr> multiPlaneSegment(cv::Mat &img_in, pcl::PointCloud<PointT>::Ptr &cloud_in, double distance_threshold, int max_iter, float stop_req)
+std::vector<pcl::PointCloud<PointT>::Ptr> multiPlaneCloudSegment(cv::Mat &img_in, pcl::PointCloud<PointT>::Ptr &cloud_in, double distance_threshold, int max_iter, float stop_req)
 {
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>);
     pcl::copyPointCloud(*cloud_in, *cloud); // 深拷贝
@@ -95,6 +96,120 @@ std::vector<pcl::PointCloud<PointT>::Ptr> multiPlaneSegment(cv::Mat &img_in, pcl
     return planes;
 }
 
+
+/**
+ * @brief: 点云多平面分割
+ * @param {Mat} &img_in
+ * @param {Ptr} &cloud_in
+ * @param {double} distance_threshold
+ * @param {int} max_iter
+ * @param {float} stop_req
+ * @return {*} 结构体（平面电云、平面参数）
+ * @note: 
+ * @warning: 
+ */
+std::vector<SegPlaneClouds> multiPlaneSegment(cv::Mat &img_in, pcl::PointCloud<PointT>::Ptr &cloud_in, double distance_threshold, int max_iter, float stop_req)
+{
+    std::vector<SegPlaneClouds> SegPlaneClouds_vtr;
+
+    pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>);
+    pcl::copyPointCloud(*cloud_in, *cloud); // 深拷贝
+    
+    pcl::PointCloud<PointT>::Ptr cloud_seg_remain(new pcl::PointCloud<PointT>);
+    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+    std::vector<pcl::PointCloud<PointT>::Ptr> planes;
+
+    int point_num = cloud->size();
+    int plane_num = 0;                              // 记录平面总数
+    while (cloud->size() > stop_req * point_num) // 点云数不足 20% 时停止分割
+    {
+        SegPlaneClouds SegPlaneClouds;
+        pcl::PointCloud<PointT>::Ptr cloud_seg(new pcl::PointCloud<PointT>); // 每次new一块新的内存，若放在循环外面，存入vector的指针指向同一块内存
+        pcl::ModelCoefficients::Ptr coefficient(new pcl::ModelCoefficients);
+
+        if (planeSegment(cloud, distance_threshold, max_iter, cloud_seg_remain, cloud_seg, coefficient, inliers) == false) // 内点为 0 时跳出循环
+            break;
+
+        SegPlaneClouds.plane_coefficient = coefficient;
+        SegPlaneClouds.plane_cloud = cloud_seg;
+        SegPlaneClouds_vtr.push_back(SegPlaneClouds);
+        
+        *cloud = *cloud_seg_remain;
+        plane_num++;
+    }
+    return SegPlaneClouds_vtr;
+}
+
+
+/**
+ * @brief: 计算点到平面的距离
+ * @param {float} x
+ * @param {float} y
+ * @param {float} z
+ * @param {Ptr} &coefficients
+ * @return {*} 点到平面的距离
+ * @note: 
+ * @warning: 
+ */
+double point2PlaneDistance(float x, float y, float z, pcl::ModelCoefficients::Ptr &coefficients)
+{
+    return std::abs(x * coefficients->values[0] + y * coefficients->values[1] + z * coefficients->values[2] + coefficients->values[3]);
+}
+
+
+/**
+ * @brief: 点云转深度图
+ * @param {Ptr} &cloud_in
+ * @param {Ptr} &cloud_seg
+ * @param {Ptr} coefficients
+ * @param {double} distance_threshold
+ * @return {*}
+ * @note: 
+ * @warning: 
+ */
+SegImages pointCloud2Heightmap(cv::Mat &img_in, pcl::PointCloud<PointT>::Ptr &cloud_in, SegPlaneClouds SegPlaneCloud, double distance_threshold)
+{
+    SegImages SegImage1;
+    cv::Mat heightmap = cv::Mat_<uchar>(cloud_in->height, cloud_in->width, CV_8UC1);
+    cv::Mat img_seg = cv::Mat_<uchar>(cloud_in->height, cloud_in->width, CV_8UC1);
+
+    float z = - SegPlaneCloud.plane_coefficient->values[3] / SegPlaneCloud.plane_coefficient->values[2];
+    auto point_min_z = minmax_element(SegPlaneCloud.plane_cloud->points.begin(), SegPlaneCloud.plane_cloud->points.end(), compare_z); //返回迭代器
+    float maxmin_distance = (*point_min_z.second).z - (*point_min_z.first).z;
+    std::cout << maxmin_distance <<std::endl;
+
+    for(int i = 0; i < cloud_in->height; i++)
+    {
+        for(int j = 0; j < cloud_in->width; j++)
+        {
+            int k = i * cloud_in->width + j;
+            float d = point2PlaneDistance(cloud_in->points[k].x, cloud_in->points[k].y, cloud_in->points[k].z, SegPlaneCloud.plane_coefficient);
+            // std::cout << "z: " << cloud_in->points[k].z - z << ", " << "d: " << d << std::endl;
+            if(!std::isnan(cloud_in->points[k].z) && d < distance_threshold
+                    // && cloud_in->points[k].z < max
+                    // && cloud_in->points[k].z > min
+            )
+            {
+                heightmap.at<uchar>(i, j) = (cloud_in->points[k].z - (*point_min_z.first).z) / maxmin_distance * 255.0f;
+                img_seg.at<uchar>(i, j) = img_in.at<uchar>(i, j); // 将原图属于该平面的部分赋值给新图片
+                cloud_in->points[k].z = -NAN;
+                
+            }
+            else
+            {
+                heightmap.at<uchar>(i, j) = 255; // 非当前平面部分设为白色
+                img_seg.at<uchar>(i, j) = 255; // 非当前平面部分设为白色
+            }
+            
+        }
+    }
+
+    SegImage1.image = img_seg;
+    SegImage1.gray_heightmap = heightmap;
+    cv::applyColorMap(heightmap, SegImage1.color_heightmap, cv::COLORMAP_JET);
+
+    return SegImage1;
+}
 
 
 /**
